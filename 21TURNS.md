@@ -3,18 +3,19 @@
 ## Table of Contents
 
 1. [Vision & Philosophy](#vision--philosophy)
-2. [Core Game Loop](#core-game-loop)
-3. [Turn Phase State Machine](#turn-phase-state-machine)
-4. [Sector System](#sector-system)
-5. [Labor System](#labor-system)
-6. [Resource Economy](#resource-economy)
-7. [Feedback Systems (Approval & Pollution)](#feedback-systems)
-8. [Research System](#research-system)
-9. [Market Systems](#market-systems)
-10. [Victory Conditions & Scoring](#victory-conditions--scoring)
-11. [Data Structures](#data-structures)
-12. [Formulas & Calculations Reference](#formulas--calculations-reference)
-13. [UI Requirements](#ui-requirements)
+2. [System Overview Map](#system-overview-map)
+3. [Core Game Loop](#core-game-loop)
+4. [Turn Phase State Machine](#turn-phase-state-machine)
+5. [Sector System](#sector-system)
+6. [Labor System](#labor-system)
+7. [Resource Economy](#resource-economy)
+8. [Feedback Systems (Approval & Pollution)](#feedback-systems)
+9. [Research System](#research-system)
+10. [Market Systems](#market-systems)
+11. [Victory Conditions & Scoring](#victory-conditions--scoring)
+12. [Data Structures](#data-structures)
+13. [Formulas & Calculations Reference](#formulas--calculations-reference)
+14. [UI Requirements](#ui-requirements)
 
 ---
 
@@ -79,6 +80,398 @@ This single constraint defines everything:
 5. Players report "I want to try a different strategy" (emergent depth)
 
 **We prove:** Bounded challenges with meaningful decisions can compete with endless progression for player engagement.
+
+---
+
+## System Overview Map
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                         GAME LOOP (21 TURNS)                    │
+│                                                                 │
+│  Turn Start → 6 Phases → Turn Resolution → Next Turn / End     │
+│               (5 min)     (Server-side)                         │
+└─────────────────────────────────────────────────────────────────┘
+                                   ↓
+┌─────────────────────────────────────────────────────────────────┐
+│                      CORE RESOURCE ECONOMY                      │
+│                                                                 │
+│  Credits ←──────┐                                               │
+│  Fuel   ←──────┼─── PRODUCTION (each turn)                     │
+│  Research Points├─── Workers × Skill × (1 - Pollution Penalty) │
+│  Population ←───┘    (except RP, not affected by pollution)    │
+│                                                                 │
+│  All stored without limits, can deficit (consequences apply)   │
+└─────────────────────────────────────────────────────────────────┘
+                                   ↓
+┌─────────────────────────────────────────────────────────────────┐
+│                        SECTOR SYSTEM                            │
+│                                                                 │
+│  4 Sector Types (owned by player):                             │
+│  ┌────────────────┬──────────┬───────────┬────────────────┐    │
+│  │ Gas Giant      │ Habitat  │ Trade Stn │ Research Colony│    │
+│  ├────────────────┼──────────┼───────────┼────────────────┤    │
+│  │ Produces: Fuel │ Provides │ Produces  │ Produces: RP   │    │
+│  │ Cap: 50 pop    │ Capacity │ Credits   │ Cap: 75 pop    │    │
+│  │ Pollutes: +0.2 │ 200 pop  │ Cap: 100  │ Cleans: -0.2   │    │
+│  │ Maint: 100 Cr  │ Cleans:  │ Pollutes: │ Maint: 200 Cr  │    │
+│  │                │ -0.1     │ +0.05     │ + 100 Fuel     │    │
+│  │                │ Maint:   │ Maint:    │                │    │
+│  │                │ 200 Cr + │ 100 Cr    │                │    │
+│  │                │ 100 Fuel │           │                │    │
+│  └────────────────┴──────────┴───────────┴────────────────┘    │
+│                                                                 │
+│  Market: 100 sectors total (shared pool across all types)      │
+│  Price increases as supply decreases (1× → 3× over 100→0)      │
+│  Can buy/sell anytime (Phase 3), sell at 80% of market price   │
+└─────────────────────────────────────────────────────────────────┘
+                                   ↓
+┌─────────────────────────────────────────────────────────────────┐
+│                        LABOR SYSTEM                             │
+│                                                                 │
+│  Population assigned to 3 roles:                               │
+│  ┌──────────────┬────────────────┬──────────────────────┐      │
+│  │ Extractors   │ Traders        │ Researchers          │      │
+│  ├──────────────┼────────────────┼──────────────────────┤      │
+│  │ Work in:     │ Work in:       │ Work in:             │      │
+│  │ Gas Giants   │ Trade Stations │ Research Colonies    │      │
+│  │              │                │                      │      │
+│  │ Produce:     │ Produce:       │ Produce:             │      │
+│  │ 6 Fuel/turn  │ 1,200 Cr/turn  │ 0.25 RP/turn         │      │
+│  │              │                │                      │      │
+│  │ Affected by  │ Affected by    │ NOT affected by      │      │
+│  │ pollution    │ pollution      │ pollution            │      │
+│  └──────────────┴────────────────┴──────────────────────┘      │
+│                                                                 │
+│  Skill System:                                                  │
+│  • Start at 50% efficiency when assigned                       │
+│  • Increase +5% per turn (cap: 100% after 10 turns)            │
+│  • RESET to 50% when reassigned to different role              │
+│  • Workers assigned beyond sector capacity produce nothing     │
+│                                                                 │
+│  Path Dependency: Early assignments compound, switching costly │
+└─────────────────────────────────────────────────────────────────┘
+                                   ↓
+┌─────────────────────────────────────────────────────────────────┐
+│                    FEEDBACK LOOPS (Dynamic Constraints)         │
+│                                                                 │
+│  APPROVAL RATING (0-100%)                                       │
+│  ┌──────────────────────────────────────────────────────────┐  │
+│  │ Affects: Population growth rate                          │  │
+│  │                                                          │  │
+│  │ Increases from:              Decreases from:            │  │
+│  │ • Credit surplus (+1)        • Credit deficit (-2)      │  │
+│  │ • Low density <70% (+1)      • Fuel deficit (-2/turn)   │  │
+│  │ • Successful expansion (+1)  • High density >85% (-1)   │  │
+│  │ • All maintenance paid (+1)  • Very high >95% (-3)      │  │
+│  │                              • Failed maintenance (-5)   │  │
+│  │                              • Pop. decline (-2)         │  │
+│  │                              • High pollution >60% (-2)  │  │
+│  │                                                          │  │
+│  │ Critical Threshold: <30% = 10% revolt chance per turn   │  │
+│  │ Revolt: -20% population, -10% credits, reset to 40%     │  │
+│  └──────────────────────────────────────────────────────────┘  │
+│                                                                 │
+│  POLLUTION (0-100%)                                             │
+│  ┌──────────────────────────────────────────────────────────┐  │
+│  │ Affects: Production efficiency (Credits & Fuel only)     │  │
+│  │                                                          │  │
+│  │ Penalty Curve:                                          │  │
+│  │ • 0-20%: No penalty                                     │  │
+│  │ • 21-40%: -5% production                                │  │
+│  │ • 41-60%: -15% production                               │  │
+│  │ • 61-80%: -30% production                               │  │
+│  │ • 81-100%: -50% production (economy choking)            │  │
+│  │                                                          │  │
+│  │ Generation: +0.2/turn per Gas Giant, +0.05 per Trade Stn│  │
+│  │ Reduction: -0.1/turn per Habitat, -0.2 per Research Col │  │
+│  │ Natural Decay: -1% of current pollution per turn        │  │
+│  └──────────────────────────────────────────────────────────┘  │
+│                                                                 │
+│  POPULATION GROWTH                                              │
+│  ┌──────────────────────────────────────────────────────────┐  │
+│  │ Formula: base_rate × approval_factor × capacity_factor   │  │
+│  │                                                          │  │
+│  │ base_rate = 5% max                                       │  │
+│  │ approval_factor = (approval - 50) / 50                   │  │
+│  │   (negative if approval < 50 → emigration)              │  │
+│  │ capacity_factor:                                         │  │
+│  │   < 70% density: 1.0× (plenty of room)                  │  │
+│  │   70-90% density: 1.0× (normal)                         │  │
+│  │   90-95% density: 0.5× (crowded, slowed)                │  │
+│  │   > 95% density: 0.0× (at capacity, no growth)          │  │
+│  │                                                          │  │
+│  │ Calculated and applied during Turn Resolution           │  │
+│  └──────────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────────┘
+                                   ↓
+┌─────────────────────────────────────────────────────────────────┐
+│                      RESEARCH SYSTEM                            │
+│                                                                 │
+│  Single Technology: TERRAFORM SECTOR                            │
+│                                                                 │
+│  Unlock: 500 RP (one-time cost)                                │
+│  Effect: Change any owned sector to any other type             │
+│                                                                 │
+│  Upgrade Progression (10 levels):                              │
+│  ┌─────────┬──────────────┬────────────────┬────────────────┐  │
+│  │ Level   │ RP Cost      │ Terraform Cost │ Total RP Spent │  │
+│  ├─────────┼──────────────┼────────────────┼────────────────┤  │
+│  │ 1       │ 500          │ 50,000 Cr      │ 500            │  │
+│  │ 2       │ +200         │ 45,000 Cr      │ 700            │  │
+│  │ 3       │ +300         │ 40,000 Cr      │ 1,000          │  │
+│  │ 4       │ +400         │ 35,000 Cr      │ 1,400          │  │
+│  │ 5       │ +500         │ 30,000 Cr      │ 1,900          │  │
+│  │ ...     │ ...          │ ...            │ ...            │  │
+│  │ 10 (MAX)│ +1,000       │ 5,000 Cr       │ 5,900          │  │
+│  └─────────┴──────────────┴────────────────┴────────────────┘  │
+│                                                                 │
+│  Terraform Mechanics:                                           │
+│  • Costs Credits (based on level), instant transformation      │
+│  • Does NOT reassign workers automatically                     │
+│  • Workers remain in old role, produce nothing until manually  │
+│    reassigned (which resets their skill to 50%)                │
+│  • Cannot terraform offline sectors (must pay maintenance)     │
+│                                                                 │
+│  Strategic Uses:                                                │
+│  • Fix early mistakes (bought wrong sector types)              │
+│  • Adapt to strategy pivots mid-game                           │
+│  • Optimize sector mix in late game (turns 16-21)              │
+│  • Manage pollution (convert Gas Giants to cleaner types)      │
+└─────────────────────────────────────────────────────────────────┘
+                                   ↓
+┌─────────────────────────────────────────────────────────────────┐
+│                    TURN RESOLUTION (Server-Side)                │
+│                                                                 │
+│  Execution Order (critical for deterministic results):         │
+│                                                                 │
+│  1. CALCULATE PRODUCTION                                        │
+│     • Count workers per role × base production × skill         │
+│     • Apply pollution penalty (Credits & Fuel only)            │
+│     • Cap by sector capacity (excess workers produce nothing)  │
+│     • Add resources to player totals                           │
+│                                                                 │
+│  2. APPLY MAINTENANCE COSTS                                     │
+│     • Deduct Credits/Fuel for each online sector               │
+│     • If insufficient: mark sectors offline, accumulate debt   │
+│                                                                 │
+│  3. UPDATE APPROVAL RATING                                      │
+│     • Calculate deltas from all sources (see Feedback Loops)   │
+│     • Clamp to 0-100 range                                     │
+│     • Check for revolt (if <30%: RNG roll based on run_id +    │
+│       turn_number seed, 10% chance)                            │
+│     • If revolt: apply penalties, set flag (revolt_occurred)   │
+│                                                                 │
+│  4. UPDATE POLLUTION                                            │
+│     • Sum generation (Gas Giants, Trade Stations)              │
+│     • Sum reduction (Habitats, Research Colonies)              │
+│     • Apply natural decay (1% of current)                      │
+│     • Clamp to 0-100 range                                     │
+│                                                                 │
+│  5. CALCULATE POPULATION GROWTH                                 │
+│     • Use approval rating and capacity factor                  │
+│     • Apply growth/decline delta                               │
+│     • Floor at 0 (cannot go negative)                          │
+│     • Check if <50: trigger Game Over flag                     │
+│                                                                 │
+│  6. UPDATE WORKER SKILLS                                        │
+│     • For each labor group still assigned: +5% skill (max 100%)│
+│     • Newly reassigned groups already reset to 50% in Phase 4  │
+│                                                                 │
+│  7. SAVE STATE SNAPSHOT                                         │
+│     • Store turn_history entry with all values                 │
+│     • Calculate and cache networth                             │
+│                                                                 │
+│  8. INCREMENT TURN COUNTER                                      │
+│     • If turn < 21: prepare for next turn                      │
+│     • If turn == 21: calculate final score, submit leaderboard │
+│                                                                 │
+│  9. CHECK GAME OVER CONDITIONS                                  │
+│     • Population < 50: Empire Collapsed                        │
+│     • Turn == 21: Calculate Final Score                        │
+└─────────────────────────────────────────────────────────────────┘
+                                   ↓
+┌─────────────────────────────────────────────────────────────────┐
+│                  VICTORY CONDITIONS & SCORING                   │
+│                                                                 │
+│  BASE NETWORTH (sum of all assets at Turn 21):                 │
+│  credits + (fuel × 10) + sector_market_values +                │
+│  (population × 100) + (research_points × 50)                   │
+│                                                                 │
+│  FINAL SCORE = base_networth × efficiency × sustainability ×   │
+│                mastery                                          │
+│                                                                 │
+│  EFFICIENCY MULTIPLIER (1.0 - 1.5×):                            │
+│  Based on productive turns (turns with networth increase)      │
+│  = 1.0 + (productive_turns / 21) × 0.5                         │
+│                                                                 │
+│  SUSTAINABILITY MULTIPLIER (0.5 - 1.2×):                        │
+│  Based on final pollution and approval                         │
+│  = [(100 - pollution) × 0.006] + [approval × 0.006]           │
+│  Penalizes dirty/unstable empires, rewards clean/stable        │
+│                                                                 │
+│  MASTERY MULTIPLIER (1.0 - 2.0×):                               │
+│  Based on strategic execution:                                 │
+│  • Terraform unlock timing: (21 - unlock_turn)/21 × 30 points │
+│  • Terraform level: level × 3 points                           │
+│  • Average worker skill: avg_skill × 0.4 points                │
+│  • Terraform usage: min(num_uses × 5, 20) points               │
+│  = 1.0 + (total_points / 100)                                  │
+│                                                                 │
+│  Winner: Highest Final Score                                   │
+│  Tiebreaker: Higher base networth, then earlier completion     │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Key Feedback Loops
+
+**1. Economic Snowball (Positive Feedback)**
+```
+More Credits → Buy more Trade Stations → Assign more Traders →
+More Credits → (repeat) → Exponential growth
+
+Constraint: Sector market depletion (rising prices slow expansion)
+Constraint: Population capacity (need Habitats to grow workers)
+Constraint: Pollution (reduces Credit production efficiency)
+```
+
+**2. Pollution Death Spiral (Negative Feedback)**
+```
+High Pollution → Lower production → Less Credits →
+Can't buy Research Colonies → Pollution increases →
+(repeat) → Economy collapses
+
+Escape: Early investment in Research Colonies (prevention)
+Escape: Terraform Gas Giants to cleaner types (cure)
+```
+
+**3. Population Density Trap (Negative Feedback)**
+```
+High Density → Lower Approval → Population decline →
+Less workers → Less production → Can't afford Habitats →
+Density stays high → (repeat)
+
+Escape: Build Habitats preemptively (before density crisis)
+Escape: Leave population unassigned (reserve capacity buffer)
+```
+
+**4. Skill Lock-In (Path Dependency)**
+```
+Assign 200 Traders Turn 1 → 10 turns to reach 100% skill →
+Locked into Trade Station strategy (switching resets to 50%)
+
+Trade-off: Early commitment vs. late flexibility
+Strategic decision: When to pivot? (cost = 10 turns of skill growth)
+```
+
+### Strategic Archetypes
+
+**Rush Strategy (Terraform Early)**
+- Assign heavy Researchers Turn 1 (200+ workers)
+- Unlock terraform by Turn 8-10
+- Sacrifice early economic growth for flexibility
+- High Mastery multiplier (early unlock, high level)
+- Risk: Lower base networth (fewer Credits accumulated)
+
+**Economic Strategy (Terraform Late/Never)**
+- Assign heavy Traders Turn 1 (300+ workers)
+- Maximize Credit production early
+- Buy many sectors while prices low
+- High base networth, low Mastery multiplier
+- Risk: Locked into initial sector choices, high pollution
+
+**Balanced Strategy (Mid-Game Terraform)**
+- Mixed assignments (150 Traders, 150 Extractors, 50 Researchers)
+- Unlock terraform Turn 12-15
+- Moderate networth, moderate multipliers
+- Adapt based on Turn 10-12 state
+- Risk: Neither specialized advantage
+
+**Sustainability Focus (Pollution Management)**
+- Buy Research Colonies early
+- Keep pollution <40% (avoid heavy penalties)
+- High Sustainability multiplier
+- Lower production (Research Colonies expensive)
+- Risk: Slower growth, may lose to Economic players
+
+### Critical Decision Points
+
+**Turn 1: Initial Allocation**
+- Must buy Habitats (population capacity)
+- Must buy income sectors (Trade Stations or Gas Giants)
+- Sets trajectory for entire run (path dependency)
+
+**Turn 7-10: Commitment Phase**
+- Workers approaching max skill (90-100%)
+- Switching becomes very expensive
+- Must decide: Stay course or pivot?
+
+**Turn 12-15: Mid-Game Pivot**
+- Terraform typically unlocks here (Balanced strategy)
+- First chance to correct early mistakes
+- Sector market 50% depleted (prices rising)
+
+**Turn 16-21: Optimization Phase**
+- Last chance for meaningful changes
+- Terraform Level 5-7 (cheap transforms)
+- Focus: Maximize multipliers for scoring
+
+### Common Failure Modes
+
+**1. No Habitats → Population Starvation**
+- Buy only Trade Stations Turn 1
+- Population cannot grow (no capacity)
+- Approval tanks, population declines
+- Game Over by Turn 5-8
+
+**2. Skill Reset Cascade**
+- Reassign workers multiple times
+- All workers stuck at 50% skill
+- Production never scales
+- Low final score (poor Mastery multiplier)
+
+**3. Pollution Choking**
+- Buy many Gas Giants (need Fuel for maintenance)
+- Pollution hits 60-80% (-30% production penalty)
+- Cannot afford Research Colonies (already in deficit)
+- Death spiral, cannot recover
+
+**4. Market Timing Miss**
+- Wait until Turn 10+ to buy sectors
+- Prices 2-3× higher (market depleted)
+- Credits spent on expensive sectors
+- Lower final networth (fewer sectors owned)
+
+**5. Maintenance Cascade Failure**
+- Over-expand without income buffer
+- One turn of negative Credits
+- Cannot pay maintenance → sectors offline
+- Approval tanks → population declines → production drops
+- Positive feedback loop to failure
+
+### Design Intent Summary
+
+**Constraints Create Interesting Choices:**
+- 21 turns (not 20, not 25 - specific enough to plan)
+- 5-minute timer (pressure without panic)
+- Skill reset on reassignment (commitment matters)
+- Market depletion (early expansion advantage)
+- Pollution/Approval trade-offs (cannot optimize both)
+
+**Emergent Complexity:**
+- No dominant strategy (Rock-Paper-Scissors balance)
+- Multiple viable paths to victory
+- Early mistakes are recoverable (terraform unlock)
+- Skill ceiling visible but distant (optimization depth)
+
+**Replayability Sources:**
+- Different strategic archetypes
+- Timing variations (when to unlock/pivot)
+- Optimization challenges (maximize each multiplier)
+- Leaderboard competition (beat top scores)
+- Self-improvement (beat personal best)
+
+This is not a game about grinding or paying. It's a game about **thinking**, **planning**, and **optimizing within constraints**. The 21-turn structure makes every run a complete strategic puzzle with a definitive solution - but finding that solution requires skill, experience, and adaptation.
 
 ---
 
