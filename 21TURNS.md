@@ -1,4 +1,6 @@
-# `Battle Realms: 21 Turns to Build an Empire` Implementation Specification
+# `Battle Realms: 21 Turns to Build an Empire`
+
+# Game Design & Implementation Specification (DRAFT)
 
 ## Table of Contents
 
